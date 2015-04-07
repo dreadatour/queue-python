@@ -11,7 +11,7 @@ Library depends on:
 
 Basic usage can be found in tests. Description on every command is in source code.
 
-Big thanks to Dmitriy Shveenkov and `Alexandr (FZambia) Emelin <https://github.com/FZambia>`_.
+Big thanks to `Dmitriy Shveenkov <https://github.com/shveenkov/>`_ and `Alexandr (FZambia) Emelin <https://github.com/FZambia/>`_.
 
 For install of latest "stable" version type:
 
