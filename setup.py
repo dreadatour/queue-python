@@ -13,7 +13,7 @@ cmdclass = {}
 
 try:
     from sphinx.setup_command import BuildDoc
-    cmdclass["build_sphinx"] = BuildDoc
+    cmdclass['build_sphinx'] = BuildDoc
 except ImportError:
     pass
 
@@ -26,7 +26,7 @@ def read(*parts):
 
 def find_version(*file_paths):
     version_file = read(*file_paths)
-    version_match = re.search(r"""^__version__\s*=\s*(['"])(.+)\1""",
+    version_match = re.search(r"""^__version__\s*=\s*(['"])(.+?)\1""",
                               version_file, re.M)
     if version_match:
         return version_match.group(2)
@@ -46,17 +46,17 @@ setup(
     maintainer='Eugine Blikh',
     maintainer_email='bigbes@gmail.com',
     license='MIT',
-    packages=['tarantool_queue'],
-    platforms=["all"],
+    packages=['tarantool_queue', 'tarantool_queue.lts'],
+    platforms=['all'],
     install_requires=[
         'msgpack-python',
-        'tarantool<0.4'
+        'tarantool>0.6'
     ],
-    url='http://github.com/tarantool/tarantool-queue-python',
-    test_suite='tests.test_queue',
+    url='http://github.com/tarantool/queue-python',
+    test_suite='tests',
     tests_require=[
         'msgpack-python',
-        'tarantool'
+        'tarantool>0.6'
     ],
     classifiers=[
         'Development Status :: 4 - Beta',

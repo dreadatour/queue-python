@@ -3,7 +3,7 @@ import struct
 import msgpack
 import threading
 
-import tarantool
+import tarantool.lts
 
 
 def unpack_long_long(value):
@@ -252,8 +252,8 @@ class TQueue(object):
             True
     """
 
-    DataBaseError = tarantool.DatabaseError
-    NetworkError = tarantool.NetworkError
+    DataBaseError = tarantool.lts.DatabaseError
+    NetworkError = tarantool.lts.NetworkError
 
     class BadConfigException(Exception):
         pass
@@ -299,7 +299,7 @@ class TQueue(object):
         it will use msgpack for serializing.
         """
         if not hasattr(self, '_serialize'):
-            self.serialize = self.basic_serialize
+            self._serialize = self.basic_serialize
         return self._serialize
 
     @serialize.setter
@@ -343,10 +343,10 @@ class TQueue(object):
         """
         Tarantool Connection class: must be class with methods call and
         __init__. If it sets to None or deleted - it will use the default
-        tarantool.Connection class for connection.
+        tarantool.lts.Connection class for connection.
         """
         if not hasattr(self, '_conclass'):
-            self._conclass = tarantool.Connection
+            self._conclass = tarantool.lts.Connection
         return self._conclass
 
     @tarantool_connection.setter
@@ -355,7 +355,7 @@ class TQueue(object):
             if cls is not None:
                 raise TypeError("Connection class must have"
                                 " connect and call methods or be None")
-        self._conclass = cls if cls is not None else tarantool.Connection
+        self._conclass = cls if cls is not None else tarantool.lts.Connection
         if hasattr(self, '_tnt'):
             self.__dict__.pop('_tnt')
 

@@ -1,666 +1,501 @@
 # -*- coding: utf-8 -*-
-import re
-import struct
-import msgpack
+"""
+Python bindings for Tarantool queue script.
+
+See also: http://github.com/tarantool/queue
+"""
 import threading
 
 import tarantool
 
 
-def unpack_long_long(value):
-    return struct.unpack("<q", value)[0]
-
-
-def unpack_long(value):
-    return struct.unpack("<l", value)[0]
+TASK_STATUS = {
+    'r': 'ready',
+    't': 'taken',
+    '-': 'done',
+    '!': 'buried',
+    '~': 'delayed',
+}
 
 
 class Task(object):
     """
     Tarantool queue task wrapper.
-
-    .. warning::
-
-        Don't instantiate it with your bare hands
     """
-    def __init__(self, queue, space=0, task_id=0,
-                 tube="", status="", raw_data=None):
-        self.task_id = task_id
+    def __init__(self, tube, task_id, status, data):
         self.tube = tube
+        self.queue = tube.queue
+        self.task_id = task_id
         self.status = status
-        self.raw_data = raw_data
-        self.space = space
-        self.queue = queue
-        self.modified = False
+        self.data = data
+
+    def __str__(self):
+        return "Task (id: {0}, status: {1})".format(self.task_id,
+                                                    self.status_name)
+
+    def __del__(self):
+        if self.status == 't':
+            try:
+                self.release()
+            except self.queue.DatabaseError:
+                pass
+
+    @property
+    def status_name(self):
+        """
+        Returns status full name.
+        """
+        return TASK_STATUS.get(self.status, 'UNKNOWN')
+
+    @classmethod
+    def from_tuple(cls, tube, the_tuple):
+        """
+        Create queue task from tuple, returns `Task` instance.
+        """
+        if the_tuple is None:
+            return
+
+        if not the_tuple.rowcount:
+            raise Queue.ZeroTupleException("error creating task")
+
+        row = the_tuple[0]
+        return cls(tube, task_id=row[0], status=row[1], data=row[2])
+
+    def update_from_tuple(self, the_tuple):
+        """
+        Update task from tuple.
+        """
+        if not the_tuple.rowcount:
+            raise Queue.ZeroTupleException("error updating task")
+
+        row = the_tuple[0]
+        self.status = row[1]
+        self.data = row[2]
 
     def ack(self):
         """
-        Confirm completion of a task. Before marking a task as complete
+        Report task successful execution.
 
-        :rtype: `Task` instance
+        Returns `True` is task is acked (task status is 'done' now).
         """
-        self.modified = True
-        return self.queue._ack(self.task_id)
+        the_tuple = self.queue.ack(self.tube, self.task_id)
+        self.update_from_tuple(the_tuple)
 
-    def release(self, **kwargs):
-        """
-        Return a task back to the queue: the task is not executed.
+        return self.status == '-'
 
-        :param ttl: new time to live
-        :param delay: new delay for task
-        :type ttl: int
-        :type delay: int
-        :rtype: `Task` instance
+    def release(self, delay=None):
         """
-        self.modified = True
-        return self.queue._release(self.task_id, **kwargs)
+        Put the task back into the queue.
 
-    def delete(self):
-        """
-        Delete a task from the queue (regardless of task state or status).
+        May contain a possible new `delay` before the task is executed again.
 
-        :rtype: boolean
+        Returns `True` is task is released
+            (task status is 'ready' or 'delayed' if `delay` is set now).
         """
-        self.modified = True
-        return self.queue._delete(self.task_id)
+        the_tuple = self.queue.release(self.tube, self.task_id, delay=delay)
+        self.update_from_tuple(the_tuple)
 
-    def requeue(self):
-        """
-        Return a task to the queue, the task is not executed.
-        Puts the task at the end of the queue, so that it's
-        executed only after all existing tasks in the queue are
-        executed.
+        if delay is None:
+            return self.status == 'r'
+        else:
+            return self.status == '~'
 
-        :rtype: boolean
+    def peek(self):
         """
-        self.modified = True
-        return self.queue._requeue(self.task_id)
+        Look at a task without changing its state.
 
-    def done(self, data):
+        Always returns `True`.
         """
-        Mark a task as complete (done), but don't delete it.
-        Replaces task data with the supplied data.
+        the_tuple = self.queue.peek(self.tube, self.task_id)
+        self.update_from_tuple(the_tuple)
 
-        :param data: Data for pushing into queue
-        :rtype: boolean
-        """
-        self.modified = True
-        the_tuple = self.queue.tnt.call("queue.done", (
-            str(self.queue.space),
-            str(self.task_id),
-            self.queue.tube(self.tube).serialize(data))
-        )
-        return the_tuple.return_code == 0
+        return True
 
     def bury(self):
         """
-        Mark a task as buried. This special status excludes the
-        task from the active list, until it's dug up. This function
-        is useful when several attempts to execute a task lead to a
-        failure. Buried tasks can be monitored by the queue owner,
-        and treated specially.
-
-        :rtype: boolean
+        Disable task until its restored again.
         """
-        self.modified = True
-        return self.queue._bury(self.task_id)
+        the_tuple = self.queue.bury(self.tube, self.task_id)
+        self.update_from_tuple(the_tuple)
 
-    def dig(self):
+        return self.status == '!'
+
+    def delete(self):
         """
-        'Dig up' a buried task, after checking that the task is buried.
-        The task status is changed to ready.'
-
-        :rtype: boolean
+        Delete task (in any state) permanently.
         """
-        self.modified = True
-        return self.queue._dig(self.task_id)
+        the_tuple = self.queue.delete(self.tube, self.task_id)
+        self.update_from_tuple(the_tuple)
 
-    def meta(self):
-        """
-        Return unpacked task metadata.
-        :rtype: dict with metainformation or None
-        """
-        return self.queue._meta(self.task_id)
-
-    def touch(self):
-        """
-        Prolong living time for taken task with this id.
-
-        :rtype: boolean
-        """
-        return self.queue._touch(self.task_id)
-
-    @property
-    def data(self):
-        if not self.raw_data:
-            return None
-        if not hasattr(self, '_decoded_data'):
-            data = self.queue.tube(self.tube).deserialize(self.raw_data)
-            self._decoded_data = data
-        return self._decoded_data
-
-    def __str__(self):
-        args = (
-            self.task_id, self.tube, self.status, self.space
-        )
-        return "Task (id: {0}, tube:{1}, status: {2}, space:{3})".format(*args)
-
-    def __del__(self):
-        if self.status == 'taken' and not self.modified:
-            self.release()
-
-    @classmethod
-    def from_tuple(cls, queue, the_tuple):
-        if the_tuple is None:
-            return
-        if the_tuple.rowcount < 1:
-            raise Queue.ZeroTupleException('error creating task')
-        row = the_tuple[0]
-        return cls(
-            queue,
-            space=queue.space,
-            task_id=row[0],
-            tube=row[1],
-            status=row[2],
-            raw_data=row[3],
-        )
+        return self.status == '-'
 
 
 class Tube(object):
     """
-    Tarantol queue tube wrapper. Pinned to space and tube, but unlike Queue
-    it has predefined delay, ttl, ttr, and pri.
-
-    .. warning::
-
-        Don't instantiate it with your bare hands
+    Tarantol queue tube wrapper.
     """
     def __init__(self, queue, name, **kwargs):
         self.queue = queue
-        self.opt = {
-            'delay': 0,
-            'ttl': 0,
-            'ttr': 0,
-            'pri': 0,
-            'tube': name
-        }
-        self.opt.update(kwargs)
-        self._serialize = None
-        self._deserialize = None
+        self.name = name
+        self.options = kwargs.copy()
 
-    # ----------------
-    @property
-    def serialize(self):
+    def put(self, *args, **kwargs):
         """
-        Serialize function: must be Callable or None. Sets None when deleted
+        Enqueue a task.
         """
-        if self._serialize is None:
-            return self.queue.serialize
-        return self._serialize
+        raise NotImplementedError("can't use `Tube` abstract class")
 
-    @serialize.setter
-    def serialize(self, func):
-        if not (hasattr(func, '__call__') or func is None):
-            raise TypeError("func must be Callable "
-                            "or None, but not " + str(type(func)))
-        self._serialize = func
-
-    # ----------------
-    @property
-    def deserialize(self):
+    def take(self, timeout=None):
         """
-        Deserialize function: must be Callable or None. Sets None when deleted
+        Get a task from queue for execution.
+
+        Waits `timeout` seconds until a READY task appears in the queue.
+        Returns either a `Task` object or `None`.
         """
-        if self._deserialize is None:
-            return self.queue.deserialize
-        return self._deserialize
+        the_tuple = self.queue.take(self, timeout=timeout)
 
-    @deserialize.setter
-    def deserialize(self, func):
-        if not (hasattr(func, '__call__') or func is None):
-            raise TypeError("func must be Callable "
-                            "or None, but not " + str(type(func)))
-        self._deserialize = func
-
-    # ----------------
-    def update_options(self, **kwargs):
-        """
-        Update options for current tube (such as ttl, ttr, pri and delay)
-        """
-        self.opt.update(kwargs)
-
-    def put(self, data, **kwargs):
-        """
-        Enqueue a task. Returns a tuple, representing the new task.
-        The list of fields with task data ('...')is optional.
-        If urgent set to True then the task will get the highest priority.
-
-        :param data: Data for pushing into queue
-        :param urgent: make task urgent (Not necessary, False by default)
-        :param delay: new delay for task
-                      (Not necessary, Default of Tube object)
-        :param ttl: new time to live (Not necessary, Default of Tube object)
-        :param ttr: time to release (Not necessary, Default of Tube object)
-        :param tube: name of Tube (Not necessary, Default of Tube object)
-        :param pri: priority (Not necessary, Default of Tube object)
-        :type ttl: int
-        :type delay: int
-        :type ttr: int
-        :type tube: string
-        :type urgent: boolean
-        :rtype: `Task` instance
-        """
-        opt = dict(self.opt, **kwargs)
-
-        method = "queue.put"
-        if "urgent" in kwargs and kwargs["urgent"]:
-            opt["delay"] = 0
-            method = "queue.urgent"
-
-        the_tuple = self.queue.tnt.call(method, (
-            str(self.queue.space),
-            str(opt["tube"]),
-            str(opt["delay"]),
-            str(opt["ttl"]),
-            str(opt["ttr"]),
-            str(opt["pri"]),
-            self.serialize(data))
-        )
-
-        return Task.from_tuple(self.queue, the_tuple)
-
-    def urgent(self, data=None, **kwargs):
-        """
-        Same as :meth:`Tube.put() <tarantool_queue.Tube.put>` put,
-        but set highest priority for this task.
-        """
-        kwargs['urgent'] = True
-        return self.put(data, **dict(self.opt, **kwargs))
-
-    def take(self, timeout=0):
-        """
-        If there are tasks in the queue ready for execution,
-        take the highest-priority task. Otherwise, wait for a
-        ready task to appear in the queue, and, as soon as it appears,
-        mark it as taken and return to the consumer. If there is a
-        timeout, and the task doesn't appear until the timeout expires,
-        return 'None'. If timeout is None, wait indefinitely until
-        a task appears.
-
-        :param timeout: timeout to wait.
-        :type timeout: int or None
-        :rtype: `Task` instance or None
-        """
-        return self.queue._take(self.opt['tube'], timeout)
+        if the_tuple.rowcount:
+            return Task.from_tuple(self, the_tuple)
 
     def kick(self, count=None):
         """
-        'Dig up' count tasks in a queue. If count is not given, digs up
-        just one buried task.
+        Reset back to READY status a bunch of buried task.
+        """
+        return self.queue.kick(self, count=count)
 
-        :rtype boolean
+    def drop(self):
         """
-        return self.queue._kick(self.opt['tube'], count)
+        Drop entire query (if there are no in-progress tasks or workers).
+        """
+        return self.queue.drop(self)
 
-    def statistics(self):
+
+class TubeFifo(Tube):
+    """
+    Tarantol queue 'fifo' tube wrapper.
+    """
+    def put(self, data):
         """
-        See :meth:`Queue.statistics() <tarantool_queue.Queue.statistics>`
-        for more information.
+        Enqueue a task.
+
+        Returns a `Task` object.
         """
-        return self.queue.statistics(tube=self.opt['tube'])
+        cmd = 'queue.tube.{0}:put'.format(self.name)
+        args = (data,)
+
+        the_tuple = self.queue.tnt.call(cmd, args)
+
+        return Task.from_tuple(self, the_tuple)
+
+
+class TubeFifoTTL(Tube):
+    """
+    Tarantol queue 'fifottl' tube wrapper.
+    """
+    def put(self, data, ttl=None, ttr=None, priority=None, delay=None):
+        """
+        Enqueue a task.
+
+        @param ttl: time to live for a task put into the queue;
+            if ttl is not given, it's set to infinity;
+            "infinity" in tarantool is around 500 years (must be enough, yeah?)
+        @param ttr: time allotted to the worker to work on a task;
+            if not set, is the same as ttl
+        @param priority: task priority;
+            0 is the highest priority and is the default
+
+        Returns a `Task` object.
+        """
+        cmd = 'queue.tube.{0}:put'.format(self.name)
+        args = (data,)
+
+        params = dict()
+        if ttl is not None:
+            params['ttl'] = ttl
+        if ttr is not None:
+            params['ttr'] = ttr
+        if priority is not None:
+            params['pri'] = priority
+        if delay is not None:
+            params['delay'] = delay
+        if params:
+            args += (params,)
+
+        the_tuple = self.queue.tnt.call(cmd, args)
+
+        return Task.from_tuple(self, the_tuple)
 
 
 class Queue(object):
     """
-    Tarantool queue wrapper. Surely pinned to space. May create tubes.
-    By default it uses msgpack for serialization, but you may redefine
-    serialize and deserialize methods.
-    You must use Queue only for creating Tubes.
-    For more usage, please, look into tests.
+    Tarantool queue wrapper.
+
     Usage:
 
         >>> from tarantool_queue import Queue
-        >>> queue = Queue()
-        >>> tube1 = queue.create_tube('holy_grail', ttl=100, delay=5)
-        # Put task into the queue
-        >>> tube1.put([1, 2, 3])
-        # Put task into the beggining of queue (Highest priority)
-        >>> tube1.urgent([2, 3, 4])
-        >>> tube1.get() # We get task and automaticaly release it
-        >>> task1 = tube1.take()
-        >>> task2 = tube1.take()
+        >>> queue = Queue('127.0.0.1', 33013, user='test', password='test')
+        >>> tube = queue.tube_fifo('holy_grail')
+        # Put tasks into the queue
+        >>> tube.put([1, 2, 3])
+        >>> tube.put([2, 3, 4])
+        # Get tasks from queue
+        >>> task1 = tube.take()
+        >>> task2 = tube.take()
         >>> print(task1.data)
-            [2, 3, 4]
-        >>> print(task2.data)
             [1, 2, 3]
+        >>> print(task2.data)
+            [2, 3, 4]
+        # Release tasks (put them back to queue)
         >>> del task2
         >>> del task1
-        >>> print(tube1.take().data)
+        # Take task again
+        >>> print(tube.take().data)
             [1, 2, 3]
-        # Take task and Ack it
-        >>> tube1.take().ack()
+        # Take task and mark it as complete
+        >>> tube.take().ack()
             True
     """
-
-    DataBaseError = tarantool.DatabaseError
+    DatabaseError = tarantool.DatabaseError
     NetworkError = tarantool.NetworkError
 
     class BadConfigException(Exception):
+        """
+        Bad config queue exception.
+        """
         pass
 
     class ZeroTupleException(Exception):
+        """
+        Zero tuple queue exception.
+        """
         pass
 
-    @staticmethod
-    def basic_serialize(data):
-        return msgpack.packb(data)
-
-    @staticmethod
-    def basic_deserialize(data):
-        return msgpack.unpackb(data)
-
-    def __init__(self, host="localhost", port=33013, space=0, schema=None):
-        if not(host and port):
-            raise Queue.BadConfigException("host and port params "
-                                           "must be not empty")
+    def __init__(self, host='localhost', port=33013, user=None, password=None):
+        if not host or not port:
+            raise Queue.BadConfigException(
+                "host and port params must be not empty"
+            )
 
         if not isinstance(port, int):
             raise Queue.BadConfigException("port must be int")
 
-        if not isinstance(space, int):
-            raise Queue.BadConfigException("space must be int")
-
         self.host = host
         self.port = port
-        self.space = space
-        self.schema = schema
+        self.user = user
+        self.password = password
         self.tubes = {}
-        self._serialize = self.basic_serialize
-        self._deserialize = self.basic_deserialize
+        self._lockinst = threading.Lock()
+        self._conclass = tarantool.Connection
+        self._tnt = None
 
-    # ----------------
-    @property
-    def serialize(self):
-        """
-        Serialize function: must be Callable. If sets to None or deleted, then
-        it will use msgpack for serializing.
-        """
-        if not hasattr(self, '_serialize'):
-            self._serialize = self.basic_serialize
-        return self._serialize
-
-    @serialize.setter
-    def serialize(self, func):
-        if not (hasattr(func, '__call__') or func is None):
-            raise TypeError("func must be Callable "
-                            "or None, but not " + str(type(func)))
-        self._serialize = func if func is not None else self.basic_serialize
-
-    @serialize.deleter
-    def serialize(self):
-        self._serialize = self.basic_serialize
-
-    # ----------------
-    @property
-    def deserialize(self):
-        """
-        Deserialize function: must be Callable. If sets to None or delete,
-        then it will use msgpack for deserializing.
-        """
-        if not hasattr(self, '_deserialize'):
-            self._deserialize = self.basic_deserialize
-        return self._deserialize
-
-    @deserialize.setter
-    def deserialize(self, func):
-        if not (hasattr(func, '__call__') or func is None):
-            raise TypeError("func must be Callable "
-                            "or None, but not " + str(type(func)))
-        self._deserialize = (func
-                             if func is not None
-                             else self.basic_deserialize)
-
-    @deserialize.deleter
-    def deserialize(self):
-        self._deserialize = self.basic_deserialize
-
-    # ----------------
     @property
     def tarantool_connection(self):
         """
-        Tarantool Connection class: must be class with methods call and
-        __init__. If it sets to None or deleted - it will use the default
-        tarantool.Connection class for connection.
+        Tarantool connection getter.
+
+        Uses `tarantool.Connection` by default.
         """
-        if not hasattr(self, '_conclass'):
+        if self._conclass is None:
             self._conclass = tarantool.Connection
         return self._conclass
 
     @tarantool_connection.setter
-    def tarantool_connection(self, cls):
-        if 'call' not in dir(cls) or '__init__' not in dir(cls):
-            if cls is not None:
-                raise TypeError("Connection class must have"
-                                " connect and call methods or be None")
-        self._conclass = cls if cls is not None else tarantool.Connection
-        if hasattr(self, '_tnt'):
-            self.__dict__.pop('_tnt')
+    def tarantool_connection(self, con_cls):
+        """
+        Tarantool connection setter.
 
-    @tarantool_connection.deleter
-    def tarantool_connection(self):
-        if hasattr(self, '_conclass'):
-            self.__dict__.pop('_conclass')
-        if hasattr(self, '_tnt'):
-            self.__dict__.pop('_tnt')
+        Must be class with methods call and __init__.
+        """
+        if con_cls is None:
+            self._conclass = tarantool.Connection
+        elif 'call' in dir(con_cls) and '__init__' in dir(con_cls):
+            self._conclass = con_cls
+        else:
+            raise TypeError("Connection class must have connect"
+                            " and call methods or be None")
+        self._tnt = None
 
-    # ----------------
     @property
     def tarantool_lock(self):
         """
-        Locking class: must be locking instance with methods __enter__
-        and __exit__. If it sets to None or delete - it will use default
-        threading.Lock() instance for locking in the connecting.
+        Tarantool lock getter.
+
+        Use `threading.Lock` by default.
         """
-        if not hasattr(self, '_lockinst'):
+        if self._lockinst is None:
             self._lockinst = threading.Lock()
+
         return self._lockinst
 
     @tarantool_lock.setter
     def tarantool_lock(self, lock):
-        if '__enter__' not in dir(lock) or '__exit__' not in dir(lock):
-            if lock is not None:
-                raise TypeError("Lock class must have `__enter__`"
-                                " and `__exit__` methods or be None")
-        self._lockinst = lock if lock is not None else threading.Lock()
+        """
+        Tarantool lock setter.
 
-    @tarantool_lock.deleter
-    def tarantool_lock(self):
-        if hasattr(self, '_lockinst'):
-            self.__dict__.pop('_lockinst')
+        Must be locking instance with methods __enter__ and __exit__.
+        """
+        if lock is None:
+            self._lockinst = threading.Lock()
+        elif '__enter__' in dir(lock) and '__exit__' in dir(lock):
+            self._lockinst = lock
+        else:
+            raise TypeError("Lock class must have `__enter__`"
+                            " and `__exit__` methods or be None")
 
-    # ----------------
     @property
     def tnt(self):
-        if not hasattr(self, '_tnt'):
+        """
+        Get or create tarantool connection.
+        """
+        if self._tnt is None:
             with self.tarantool_lock:
-                if not hasattr(self, '_tnt'):
-                    self._tnt = self.tarantool_connection(self.host, self.port,
-                                                          schema=self.schema)
+                if self._tnt is None:
+                    self._tnt = self.tarantool_connection(
+                        self.host,
+                        self.port,
+                        user=self.user,
+                        password=self.password
+                    )
         return self._tnt
 
-    def _take(self, tube, timeout=0):
-        args = [str(self.space), str(tube)]
+    def take(self, tube, timeout=None):
+        """
+        Get a task from queue for execution.
+
+        Waits `timeout` seconds until a READY task appears in the queue.
+        If `timeout` is `None` - waits forever.
+
+        Returns tarantool tuple object.
+        """
+        cmd = 'queue.tube.{0}:take'.format(tube.name)
+        args = ()
+
         if timeout is not None:
-            args.append(str(timeout))
-        the_tuple = self.tnt.call("queue.take", tuple(args))
-        if the_tuple.rowcount == 0:
-            return None
-        return Task.from_tuple(self, the_tuple)
+            args += (timeout,)
 
-    def _ack(self, task_id):
-        args = (str(self.space), task_id)
-        the_tuple = self.tnt.call("queue.ack", args)
-        return the_tuple.return_code == 0
+        return self.tnt.call(cmd, args)
 
-    def _release(self, task_id, delay=0, ttl=0):
-        the_tuple = self.tnt.call("queue.release", (
-            str(self.space),
-            str(task_id),
-            str(delay),
-            str(ttl)
-        ))
-        return Task.from_tuple(self, the_tuple)
+    def ack(self, tube, task_id):
+        """
+        Report task successful execution.
 
-    def _requeue(self, task_id):
-        args = (str(self.space), task_id)
-        the_tuple = self.tnt.call("queue.requeue", args)
-        return the_tuple.return_code == 0
+        Ack is accepted only from the consumer, which took the task
+        for execution. If a consumer disconnects, all tasks taken
+        by this consumer are put back to READY state (released).
 
-    def _bury(self, task_id):
-        args = (str(self.space), task_id)
-        the_tuple = self.tnt.call("queue.bury", args)
-        return the_tuple.return_code == 0
+        Returns tarantool tuple object.
+        """
+        cmd = 'queue.tube.{0}:ack'.format(tube.name)
+        args = (task_id,)
 
-    def _delete(self, task_id):
-        args = (str(self.space), task_id)
-        the_tuple = self.tnt.call("queue.delete", args)
-        return the_tuple.return_code == 0
+        return self.tnt.call(cmd, args)
 
-    def _meta(self, task_id):
-        args = (str(self.space), task_id)
-        the_tuple = self.tnt.call("queue.meta", args)
+    def release(self, tube, task_id, delay=None):
+        """
+        Put the task back into the queue.
+
+        Used in case of a consumer for any reason can not execute a task.
+        May contain a possible new `delay` before the task is executed again.
+
+        Returns tarantool tuple object.
+        """
+        cmd = 'queue.tube.{0}:release'.format(tube.name)
+        args = (task_id,)
+
+        if delay is not None:
+            args += ({'delay': delay},)
+
+        return self.tnt.call(cmd, args)
+
+    def peek(self, tube, task_id):
+        """
+        Look at a task without changing its state.
+
+        Returns tarantool tuple object.
+        """
+        cmd = 'queue.tube.{0}:peek'.format(tube.name)
+        args = (task_id,)
+
+        return self.tnt.call(cmd, args)
+
+    def bury(self, tube, task_id):
+        """
+        Disable task until its restored again.
+
+        If a worker suddenly realized that a task is somehow poisoned,
+        can not be executed in the current circumstances, it can bury it.
+
+        Returns tarantool tuple object.
+        """
+        cmd = 'queue.tube.{0}:bury'.format(tube.name)
+        args = (task_id,)
+
+        return self.tnt.call(cmd, args)
+
+    def kick(self, tube, count=1):
+        """
+        Reset back to READY status a bunch of buried task.
+
+        Returns count of actually kicked tasts.
+        """
+        cmd = 'queue.tube.{0}:kick'.format(tube.name)
+        args = (count,)
+
+        the_tuple = self.tnt.call(cmd, args)
+
         if the_tuple.rowcount:
-            row = list(the_tuple[0])
-            for index in [3, 7, 8, 9, 10, 11, 12]:
-                row[index] = unpack_long_long(row[index])
-            for index in [6]:
-                row[index] = unpack_long(row[index])
-            keys = [
-                'task_id', 'tube', 'status', 'event', 'ipri',
-                'pri', 'cid', 'created', 'ttl', 'ttr', 'cbury',
-                'ctaken', 'now'
-            ]
-            return dict(zip(keys, row))
-        return None
+            return the_tuple[0][0]
 
-    def peek(self, task_id):
+        return 0
+
+    def delete(self, tube, task_id):
         """
-        Return a task by task id.
+        Delete task (in any state) permanently.
 
-        :param task_id: UUID of task in HEX
-        :type task_id: string
-        :rtype: `Task` instance
+        Returns tarantool tuple object.
         """
-        args = (str(self.space), task_id)
-        the_tuple = self.tnt.call("queue.peek", args)
-        return Task.from_tuple(self, the_tuple)
+        cmd = 'queue.tube.{0}:delete'.format(tube.name)
+        args = (task_id,)
 
-    def _dig(self, task_id):
-        args = (str(self.space), task_id)
-        the_tuple = self.tnt.call("queue.dig", args)
+        return self.tnt.call(cmd, args)
+
+    def drop(self, tube):
+        """
+        Drop entire query (if there are no in-progress tasks or workers).
+
+        Returns `True` on successful drop.
+        """
+        cmd = 'queue.tube.{0}:drop'.format(tube.name)
+        args = ()
+
+        the_tuple = self.tnt.call(cmd, args)
+
         return the_tuple.return_code == 0
 
-    def _kick(self, tube, count=None):
-        args = [str(self.space), str(tube)]
-        if count:
-            args.append(str(count))
-        the_tuple = self.tnt.call("queue.kick", tuple(args))
-        return the_tuple.return_code == 0
-
-    def statistics(self, tube=None):
+    def tube_fifo(self, name):
         """
-        Return queue module statistics accumulated since server start.
-        Output format: if tube != None, then output is dictionary with
-        stats of current tube. If tube is None, then output is dict of
-        t stats, ...}
-        e.g.:
+        Create 'fifo' tube object, if not created before.
 
-            >>> tube.statistics()
-            # or queue.statistics('tube0')
-            # or queue.statistics(tube.opt['tube'])
-            {'ack': '233',
-            'meta': '35',
-            'put': '153',
-            'release': '198',
-            'take': '431',
-            'take_timeout': '320',
-            'tasks': {'buried': '0',
-                    'delayed': '0',
-                    'done': '0',
-                    'ready': '0',
-                    'taken': '0',
-                    'total': '0'},
-            'urgent': '80'}
-            or
-            >>> queue.statistics()
-            {'tube0': {'ack': '233',
-                    'meta': '35',
-                    'put': '153',
-                    'release': '198',
-                    'take': '431',
-                    'take_timeout': '320',
-                    'tasks': {'buried': '0',
-                            'delayed': '0',
-                            'done': '0',
-                            'ready': '0',
-                            'taken': '0',
-                            'total': '0'},
-                    'urgent': '80'}}
-
-        :param tube: Name of tube
-        :type tube: string or None
-        :rtype: dict with statistics
+        Returns `Tube` object.
         """
-        args = (str(self.space),)
-        args = args if tube is None else args + (tube,)
-        stat = self.tnt.call("queue.statistics", args)
-        ans = {}
-        if stat.rowcount > 0:
-            for k, v in dict(zip(stat[0][0::2], stat[0][1::2])).iteritems():
-                k_t = list(
-                    re.match(r'space([^.]*)\.(.*)\.([^.]*)', k).groups()
-                )
-                if int(k_t[0]) != self.space:
-                    continue
-                if k_t[1].endswith('.tasks'):
-                    k_t = k_t[0:1] + k_t[1].split('.') + k_t[2:3]
-                if k_t[1] not in ans:
-                    ans[k_t[1]] = {'tasks': {}}
-                if len(k_t) == 4:
-                    ans[k_t[1]]['tasks'][k_t[-1]] = v
-                elif len(k_t) == 3:
-                    ans[k_t[1]][k_t[-1]] = v
-                else:
-                    raise Queue.ZeroTupleException('stats: \
-                            error when parsing respons')
-        return ans[tube] if tube else ans
+        tube = self.tubes.get(name)
 
-    def _touch(self, task_id):
-        args = (str(self.space), task_id)
-        the_tuple = self.tnt.call("queue.touch", tuple(args))
-        return the_tuple.return_code == 0
-
-    def tube(self, name, **kwargs):
-        """
-        Create Tube object, if not created before, and set kwargs.
-        If existed, return existed Tube.
-
-        :param name: name of Tube
-        :param delay: default delay for Tube tasks (Not necessary, will be 0)
-        :param ttl: default TTL for Tube tasks (Not necessary, will be 0)
-        :param ttr: default TTR for Tube tasks (Not necessary, will be 0)
-        :param pri: default priority for Tube tasks (Not necessary)
-        :type name: string
-        :type ttl: int
-        :type delay: int
-        :type ttr: int
-        :type pri: int
-        :rtype: `Tube` instance
-        """
-        if name in self.tubes:
-            tube = self.tubes[name]
-            tube.update_options(**kwargs)
-        else:
-            tube = Tube(self, name, **kwargs)
+        if tube is None:
+            tube = TubeFifo(self, name)
             self.tubes[name] = tube
+
+        return tube
+
+    def tube_fifottl(self, name):
+        """
+        Create 'fifottl' tube object, if not created before.
+
+        Returns `Tube` object.
+        """
+        tube = self.tubes.get(name)
+
+        if tube is None:
+            tube = TubeFifoTTL(self, name)
+            self.tubes[name] = tube
+
         return tube

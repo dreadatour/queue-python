@@ -6,8 +6,8 @@ Python Bindings for `Tarantool Queue <https://github.com/tarantool/queue/>`_.
 
 Library depends on:
 
-* msgpack-python 
-* tarantool
+* msgpack-python
+* tarantool>0.6
 
 Basic usage can be found in tests. Description on every command is in source code.
 
@@ -36,12 +36,29 @@ For install bleeding edge type:
 For configuring Queue in `Tarantool <http://tarantool.org>`_ read manual `Here <https://github.com/tarantool/queue>`_.
 
 Then just **import** it, create **Queue**, create **Tube**, **put** and **take** some elements:
-    
+
+For Tarantool version < 1.6.0:
+
 .. code-block:: python
 
-    >>> from tarantool_queue import Queue 
-    >>> queue = Queue("localhost", 33013, 0)
-    >>> tube = queue.tube("name_of_tube")
+    >>> from tarantool_queue.lts import Queue
+    >>> queue = Queue('localhost', 33013, 0)
+    >>> tube = queue.tube('name_of_tube')
+    >>> tube.put([1, 2, 3])
+    Not taken task instance
+    >>> task = tube.take()
+    >>> task.data # take task and read data from it
+    [1, 2, 3]
+    >>> task.ack() # move this task into state DONE
+    True
+
+For later Tarantool version:
+
+.. code-block:: python
+
+    >>> from tarantool_queue import Queue
+    >>> queue = Queue('localhost', 33013, user='test', password='test')
+    >>> tube = queue.tube_fifo('name_of_tube')
     >>> tube.put([1, 2, 3])
     Not taken task instance
     >>> task = tube.take()
